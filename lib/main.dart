@@ -39,17 +39,28 @@ class LockControlPage extends StatefulWidget {
 }
 
 class _LockControlPageState extends State<LockControlPage> {
-  // Constantes idênticas ao Config.h do ESP32
   static const String targetDeviceName = "Trava_ESP32_01";
   static const String serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-  static const String charTxUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a7"; // Nonce
-  static const String charRxUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // HMAC
-  static const String sharedSecret = "ChaveSecretaSuperSegura2026!";
+  static const String charTxUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a7";
+  static const String charRxUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+  final TextEditingController _userIdController =
+      TextEditingController(text: "admin_01");
+  final TextEditingController _secretController =
+      TextEditingController(text: "ChaveSecretaSuperSegura2026!");
 
   bool _isBusy = false;
+  bool _obscureSecret = true;
   String _statusMessage = "Pronto para destrancar";
   Color _statusColor = Colors.grey;
   final List<String> _logs = [];
+
+  @override
+  void dispose() {
+    _userIdController.dispose();
+    _secretController.dispose();
+    super.dispose();
+  }
 
   void _addLog(String text, {Color? color}) {
     setState(() {
@@ -62,13 +73,12 @@ class _LockControlPageState extends State<LockControlPage> {
     });
   }
 
-  /// Calcula HMAC-SHA256 em hexadecimal minúsculo (compatível com mbedTLS do ESP32)
-  String _computeHmacSha256(String secret, String nonce) {
+  /// Calcula HMAC-SHA256(secret, "userId:nonce")
+  String _computeUserHmac(String secret, String userId, String nonce) {
     final keyBytes = utf8.encode(secret);
-    final dataBytes = utf8.encode(nonce);
+    final dataBytes = utf8.encode("$userId:$nonce");
     final hmac = Hmac(sha256, keyBytes);
-    final digest = hmac.convert(dataBytes);
-    return digest.toString();
+    return hmac.convert(dataBytes).toString();
   }
 
   Future<bool> _requestBlePermissions() async {
@@ -93,6 +103,14 @@ class _LockControlPageState extends State<LockControlPage> {
   Future<void> _unlockDoor() async {
     if (_isBusy) return;
 
+    final userId = _userIdController.text.trim();
+    final secret = _secretController.text.trim();
+
+    if (userId.isEmpty || secret.isEmpty) {
+      _addLog("Preencha o ID do usuário e a chave.", color: Colors.orangeAccent);
+      return;
+    }
+
     setState(() {
       _isBusy = true;
       _logs.clear();
@@ -104,7 +122,6 @@ class _LockControlPageState extends State<LockControlPage> {
     try {
       if (!await _requestBlePermissions()) return;
 
-      // Garante que o adaptador Bluetooth está ligado
       final adapterState = await FlutterBluePlus.adapterState.first;
       if (adapterState != BluetoothAdapterState.on) {
         _addLog("Ligue o Bluetooth do celular.", color: Colors.orangeAccent);
@@ -146,9 +163,9 @@ class _LockControlPageState extends State<LockControlPage> {
         autoConnect: false, license: License.free,
       );
 
-      // Força o Android a descartar a tabela GATT salva dos testes com o nRF Connect
       if (Platform.isAndroid) {
         await targetDevice.clearGattCache();
+        await targetDevice.requestMtu(256);
       }
 
       _addLog("Descobrindo serviços GATT...", color: Colors.blueAccent);
@@ -171,7 +188,7 @@ class _LockControlPageState extends State<LockControlPage> {
         throw Exception("Características TX/RX não encontradas no ESP32.");
       }
 
-      // 1. Lê o nonce gerado no momento da conexão
+      // 1. Lê o nonce do desafio
       _addLog("Lendo desafio (Nonce)...", color: Colors.blueAccent);
       final nonceBytes = await txChar.read();
       final nonce = utf8.decode(nonceBytes).trim();
@@ -181,17 +198,18 @@ class _LockControlPageState extends State<LockControlPage> {
       }
       _addLog("Nonce: ${nonce.substring(0, 8)}...", color: Colors.blueAccent);
 
-      // 2. Calcula HMAC-SHA256(sharedSecret, nonce)
-      final hmacHex = _computeHmacSha256(sharedSecret, nonce);
-      _addLog("HMAC calculado. Enviando resposta...", color: Colors.blueAccent);
+      // 2. Assina "userId:nonce" com a chave individual do usuário
+      final hmacHex = _computeUserHmac(secret, userId, nonce);
+      final outboundPayload = "$userId:$hmacHex";
+      _addLog("Enviando credencial de [$userId]...", color: Colors.blueAccent);
 
-      // 3. Envia a assinatura para a característica RX
+      // 3. Envia "usuario_id:hmac" na característica RX
       await rxChar.write(
-        utf8.encode(hmacHex),
+        utf8.encode(outboundPayload),
         withoutResponse: false,
       );
 
-      _addLog("Comando enviado! Trava acionada.", color: Colors.greenAccent);
+      _addLog("Pacote enviado para [$userId]!", color: Colors.greenAccent);
     } on TimeoutException catch (e) {
       _addLog(e.message ?? "Tempo esgotado.", color: Colors.orangeAccent);
     } catch (e) {
@@ -201,7 +219,6 @@ class _LockControlPageState extends State<LockControlPage> {
       await FlutterBluePlus.stopScan();
       await scanSub?.cancel();
       if (targetDevice != null) {
-        // Desconecta imediatamente para liberar o ESP32 para outros usuários
         await Future.delayed(const Duration(milliseconds: 300));
         await targetDevice.disconnect();
       }
@@ -215,20 +232,51 @@ class _LockControlPageState extends State<LockControlPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Acesso BLE Seguro'),
+        title: const Text('Acesso BLE Multi-Usuário'),
         centerTitle: true,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(24.0),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20.0),
         child: Column(
           children: [
-            const Spacer(),
+            TextField(
+              controller: _userIdController,
+              autocorrect: false,
+              enableSuggestions: false,
+              textCapitalization: TextCapitalization.none,
+              decoration: const InputDecoration(
+                labelText: 'ID do Usuário',
+                prefixIcon: Icon(Icons.person_outline),
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _secretController,
+              obscureText: _obscureSecret,
+              autocorrect: false,
+              enableSuggestions: false,
+              textCapitalization: TextCapitalization.none,
+              decoration: InputDecoration(
+                labelText: 'Chave Secreta Individual',
+                prefixIcon: const Icon(Icons.vpn_key_outlined),
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  icon: Icon(
+                    _obscureSecret ? Icons.visibility : Icons.visibility_off,
+                  ),
+                  onPressed: () =>
+                      setState(() => _obscureSecret = !_obscureSecret),
+                ),
+              ),
+            ),
+            const SizedBox(height: 28),
             GestureDetector(
               onTap: _isBusy ? null : _unlockDoor,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 250),
-                width: 190,
-                height: 190,
+                width: 175,
+                height: 175,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: _isBusy
@@ -244,15 +292,15 @@ class _LockControlPageState extends State<LockControlPage> {
                   children: [
                     Icon(
                       _isBusy ? Icons.sync : Icons.lock_open_rounded,
-                      size: 64,
+                      size: 56,
                       color: _isBusy ? Colors.blueAccent : Colors.tealAccent,
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 10),
                     Text(
                       _isBusy ? "AUTENTICANDO" : "ABRIR TRAVA",
                       style: const TextStyle(
                         fontWeight: FontWeight.bold,
-                        fontSize: 16,
+                        fontSize: 15,
                         letterSpacing: 1.1,
                       ),
                     ),
@@ -260,17 +308,17 @@ class _LockControlPageState extends State<LockControlPage> {
                 ),
               ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 20),
             Text(
               _statusMessage,
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: _statusColor,
-                fontSize: 16,
+                fontSize: 15,
                 fontWeight: FontWeight.w600,
               ),
             ),
-            const Spacer(),
+            const SizedBox(height: 20),
             Container(
               height: 150,
               width: double.infinity,
