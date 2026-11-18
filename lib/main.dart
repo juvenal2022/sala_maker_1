@@ -188,28 +188,27 @@ class _LockControlPageState extends State<LockControlPage> {
         throw Exception("Características TX/RX não encontradas no ESP32.");
       }
 
-      // 1. Lê o nonce do desafio
-      _addLog("Lendo desafio (Nonce)...", color: Colors.blueAccent);
+      // 1. Lê o TX: o próprio ato de ler dispara o onRead no ESP32 e retorna o Nonce fresco
+      _addLog("Solicitando e lendo desafio...", color: Colors.blueAccent);
       final nonceBytes = await txChar.read();
       final nonce = utf8.decode(nonceBytes).trim();
 
-      if (nonce.isEmpty) {
-        throw Exception("Nonce recebido está vazio.");
+      if (nonce.length != 32) {
+        throw Exception("Nonce inválido (${nonce.length} bytes): '$nonce'");
       }
-      _addLog("Nonce: ${nonce.substring(0, 8)}...", color: Colors.blueAccent);
+      _addLog("Nonce OK: ${nonce.substring(0, 8)}...", color: Colors.blueAccent);
 
-      // 2. Assina "userId:nonce" com a chave individual do usuário
+      // 2. Assina "userId:nonce" com a chave individual do usuário e envia
       final hmacHex = _computeUserHmac(secret, userId, nonce);
       final outboundPayload = "$userId:$hmacHex";
-      _addLog("Enviando credencial de [$userId]...", color: Colors.blueAccent);
+      _addLog("Enviando credencial (${outboundPayload.length}B)...", color: Colors.blueAccent);
 
-      // 3. Envia "usuario_id:hmac" na característica RX
       await rxChar.write(
         utf8.encode(outboundPayload),
         withoutResponse: false,
       );
 
-      _addLog("Pacote enviado para [$userId]!", color: Colors.greenAccent);
+      _addLog("Credencial enviada para [$userId]!", color: Colors.greenAccent);
     } on TimeoutException catch (e) {
       _addLog(e.message ?? "Tempo esgotado.", color: Colors.orangeAccent);
     } catch (e) {
