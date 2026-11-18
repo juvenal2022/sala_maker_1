@@ -47,7 +47,11 @@ class _LockControlPageState extends State<LockControlPage> {
   final TextEditingController _userIdController =
       TextEditingController(text: "admin_01");
   final TextEditingController _secretController =
-      TextEditingController(text: "ChaveSecretaSuperSegura2026!");
+      TextEditingController(text: "12345678");
+
+  // Controladores do painel administrativo
+  final TextEditingController _targetUserController = TextEditingController();
+  final TextEditingController _targetSecretController = TextEditingController();
 
   bool _isBusy = false;
   bool _obscureSecret = true;
@@ -55,14 +59,25 @@ class _LockControlPageState extends State<LockControlPage> {
   Color _statusColor = Colors.grey;
   final List<String> _logs = [];
 
+  bool get _isAdmin => _userIdController.text.trim() == "admin_01";
+
+  @override
+  void initState() {
+    super.initState();
+    _userIdController.addListener(() => setState(() {}));
+  }
+
   @override
   void dispose() {
     _userIdController.dispose();
     _secretController.dispose();
+    _targetUserController.dispose();
+    _targetSecretController.dispose();
     super.dispose();
   }
 
   void _addLog(String text, {Color? color}) {
+    if (!mounted) return;
     setState(() {
       final now = DateTime.now();
       final time =
@@ -73,12 +88,10 @@ class _LockControlPageState extends State<LockControlPage> {
     });
   }
 
-  /// Calcula HMAC-SHA256(secret, "userId:nonce")
-  String _computeUserHmac(String secret, String userId, String nonce) {
+  String _computeHmac(String secret, String message) {
     final keyBytes = utf8.encode(secret);
-    final dataBytes = utf8.encode("$userId:$nonce");
-    final hmac = Hmac(sha256, keyBytes);
-    return hmac.convert(dataBytes).toString();
+    final dataBytes = utf8.encode(message);
+    return Hmac(sha256, keyBytes).convert(dataBytes).toString();
   }
 
   Future<bool> _requestBlePermissions() async {
@@ -100,14 +113,18 @@ class _LockControlPageState extends State<LockControlPage> {
     return true;
   }
 
-  Future<void> _unlockDoor() async {
+  /// Executa qualquer transação BLE autenticada (abertura ou comando admin)
+  Future<void> _executeBleTransaction({
+    required String Function(String nonce) buildPayload,
+    required String successFeedback,
+  }) async {
     if (_isBusy) return;
 
     final userId = _userIdController.text.trim();
     final secret = _secretController.text.trim();
 
     if (userId.isEmpty || secret.isEmpty) {
-      _addLog("Preencha o ID do usuário e a chave.", color: Colors.orangeAccent);
+      _addLog("Preencha o ID e a chave do usuário.", color: Colors.orangeAccent);
       return;
     }
 
@@ -131,15 +148,11 @@ class _LockControlPageState extends State<LockControlPage> {
       _addLog("Procurando $targetDeviceName...", color: Colors.blueAccent);
 
       final completer = Completer<BluetoothDevice>();
-
       scanSub = FlutterBluePlus.scanResults.listen((results) {
         for (final r in results) {
-          final advName = r.advertisementData.advName;
-          final platformName = r.device.platformName;
-          if (advName == targetDeviceName || platformName == targetDeviceName) {
-            if (!completer.isCompleted) {
-              completer.complete(r.device);
-            }
+          if (r.advertisementData.advName == targetDeviceName ||
+              r.device.platformName == targetDeviceName) {
+            if (!completer.isCompleted) completer.complete(r.device);
           }
         }
       });
@@ -151,7 +164,7 @@ class _LockControlPageState extends State<LockControlPage> {
 
       targetDevice = await completer.future.timeout(
         const Duration(seconds: 6),
-        onTimeout: () => throw TimeoutException("Trava não encontrada por perto."),
+        onTimeout: () => throw TimeoutException("Trava não encontrada."),
       );
 
       await FlutterBluePlus.stopScan();
@@ -168,9 +181,7 @@ class _LockControlPageState extends State<LockControlPage> {
         await targetDevice.requestMtu(256);
       }
 
-      _addLog("Descobrindo serviços GATT...", color: Colors.blueAccent);
       final services = await targetDevice.discoverServices();
-
       BluetoothCharacteristic? txChar;
       BluetoothCharacteristic? rxChar;
 
@@ -185,35 +196,35 @@ class _LockControlPageState extends State<LockControlPage> {
       }
 
       if (txChar == null || rxChar == null) {
-        throw Exception("Características TX/RX não encontradas no ESP32.");
+        throw Exception("Serviço BLE da trava não encontrado.");
       }
 
-      // 1. Lê o TX: o próprio ato de ler dispara o onRead no ESP32 e retorna o Nonce fresco
-      _addLog("Solicitando e lendo desafio...", color: Colors.blueAccent);
+      // Lê o Nonce gerado sob demanda no onRead do ESP32
+      _addLog("Obtendo desafio...", color: Colors.blueAccent);
       final nonceBytes = await txChar.read();
       final nonce = utf8.decode(nonceBytes).trim();
 
       if (nonce.length != 32) {
-        throw Exception("Nonce inválido (${nonce.length} bytes): '$nonce'");
+        throw Exception("Nonce inválido (${nonce.length} bytes).");
       }
-      _addLog("Nonce OK: ${nonce.substring(0, 8)}...", color: Colors.blueAccent);
 
-      // 2. Assina "userId:nonce" com a chave individual do usuário e envia
-      final hmacHex = _computeUserHmac(secret, userId, nonce);
-      final outboundPayload = "$userId:$hmacHex";
-      _addLog("Enviando credencial (${outboundPayload.length}B)...", color: Colors.blueAccent);
+      final outboundPayload = buildPayload(nonce);
+      _addLog("Enviando pacote (${outboundPayload.length}B)...",
+          color: Colors.blueAccent);
 
       await rxChar.write(
         utf8.encode(outboundPayload),
         withoutResponse: false,
       );
 
-      _addLog("Credencial enviada para [$userId]!", color: Colors.greenAccent);
+      _addLog(successFeedback, color: Colors.greenAccent);
     } on TimeoutException catch (e) {
       _addLog(e.message ?? "Tempo esgotado.", color: Colors.orangeAccent);
     } catch (e) {
-      _addLog("Erro: ${e.toString().replaceFirst('Exception: ', '')}",
-          color: Colors.redAccent);
+      _addLog(
+        "Erro: ${e.toString().replaceFirst('Exception: ', '')}",
+        color: Colors.redAccent,
+      );
     } finally {
       await FlutterBluePlus.stopScan();
       await scanSub?.cancel();
@@ -221,17 +232,75 @@ class _LockControlPageState extends State<LockControlPage> {
         await Future.delayed(const Duration(milliseconds: 300));
         await targetDevice.disconnect();
       }
-      if (mounted) {
-        setState(() => _isBusy = false);
-      }
+      if (mounted) setState(() => _isBusy = false);
     }
+  }
+
+  void _unlockDoor() {
+    final userId = _userIdController.text.trim();
+    final secret = _secretController.text.trim();
+
+    _executeBleTransaction(
+      buildPayload: (nonce) {
+        final hmac = _computeHmac(secret, "$userId:$nonce");
+        return "$userId:$hmac";
+      },
+      successFeedback: "Solicitação de abertura enviada por [$userId]!",
+    );
+  }
+
+  void _addOrUpdateUser() {
+    final adminId = _userIdController.text.trim();
+    final adminSecret = _secretController.text.trim();
+    final targetId = _targetUserController.text.trim();
+    final targetKey = _targetSecretController.text.trim();
+
+    if (targetId.isEmpty || targetId.length > 15 || targetId.contains(':')) {
+      _addLog("ID do novo usuário inválido (1-15 chars, sem ':').",
+          color: Colors.orangeAccent);
+      return;
+    }
+    if (targetKey.length < 8 || targetKey.contains(':')) {
+      _addLog("Chave inválida (mín. 8 chars, sem ':').",
+          color: Colors.orangeAccent);
+      return;
+    }
+
+    _executeBleTransaction(
+      buildPayload: (nonce) {
+        final hmac =
+            _computeHmac(adminSecret, "$adminId:ADD:$targetId:$targetKey:$nonce");
+        return "$adminId:ADD:$targetId:$targetKey:$hmac";
+      },
+      successFeedback: "Comando ADD enviado para [$targetId]!",
+    );
+  }
+
+  void _removeUser() {
+    final adminId = _userIdController.text.trim();
+    final adminSecret = _secretController.text.trim();
+    final targetId = _targetUserController.text.trim();
+
+    if (targetId.isEmpty || targetId == "admin_01") {
+      _addLog("Informe um usuário válido (diferente de admin_01).",
+          color: Colors.orangeAccent);
+      return;
+    }
+
+    _executeBleTransaction(
+      buildPayload: (nonce) {
+        final hmac = _computeHmac(adminSecret, "$adminId:DEL:$targetId:$nonce");
+        return "$adminId:DEL:$targetId:$hmac";
+      },
+      successFeedback: "Comando DEL enviado para [$targetId]!",
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Acesso BLE Multi-Usuário'),
+        title: const Text('Controle de Acesso BLE'),
         centerTitle: true,
       ),
       body: SingleChildScrollView(
@@ -244,7 +313,7 @@ class _LockControlPageState extends State<LockControlPage> {
               enableSuggestions: false,
               textCapitalization: TextCapitalization.none,
               decoration: const InputDecoration(
-                labelText: 'ID do Usuário',
+                labelText: 'Seu ID de Usuário',
                 prefixIcon: Icon(Icons.person_outline),
                 border: OutlineInputBorder(),
               ),
@@ -257,7 +326,7 @@ class _LockControlPageState extends State<LockControlPage> {
               enableSuggestions: false,
               textCapitalization: TextCapitalization.none,
               decoration: InputDecoration(
-                labelText: 'Chave Secreta Individual',
+                labelText: 'Sua Chave Secreta',
                 prefixIcon: const Icon(Icons.vpn_key_outlined),
                 border: const OutlineInputBorder(),
                 suffixIcon: IconButton(
@@ -269,13 +338,13 @@ class _LockControlPageState extends State<LockControlPage> {
                 ),
               ),
             ),
-            const SizedBox(height: 28),
+            const SizedBox(height: 24),
             GestureDetector(
               onTap: _isBusy ? null : _unlockDoor,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 250),
-                width: 175,
-                height: 175,
+                width: 155,
+                height: 155,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: _isBusy
@@ -291,15 +360,15 @@ class _LockControlPageState extends State<LockControlPage> {
                   children: [
                     Icon(
                       _isBusy ? Icons.sync : Icons.lock_open_rounded,
-                      size: 56,
+                      size: 48,
                       color: _isBusy ? Colors.blueAccent : Colors.tealAccent,
                     ),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 8),
                     Text(
-                      _isBusy ? "AUTENTICANDO" : "ABRIR TRAVA",
+                      _isBusy ? "AGUARDE" : "ABRIR TRAVA",
                       style: const TextStyle(
                         fontWeight: FontWeight.bold,
-                        fontSize: 15,
+                        fontSize: 14,
                         letterSpacing: 1.1,
                       ),
                     ),
@@ -307,19 +376,109 @@ class _LockControlPageState extends State<LockControlPage> {
                 ),
               ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
             Text(
               _statusMessage,
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: _statusColor,
-                fontSize: 15,
+                fontSize: 14,
                 fontWeight: FontWeight.w600,
               ),
             ),
-            const SizedBox(height: 20),
+
+            // Painel exclusivo quando logado como admin_01
+            if (_isAdmin) ...[
+              const SizedBox(height: 20),
+              Card(
+                color: Colors.teal.withOpacity(0.08),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  side: BorderSide(color: Colors.tealAccent.withOpacity(0.3)),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(14.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.admin_panel_settings,
+                              color: Colors.tealAccent, size: 20),
+                          SizedBox(width: 8),
+                          Text(
+                            "Administração de Usuários (NVS)",
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.tealAccent,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _targetUserController,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        textCapitalization: TextCapitalization.none,
+                        decoration: const InputDecoration(
+                          labelText: 'ID do Usuário Alvo (máx. 15 chars)',
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: _targetSecretController,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        textCapitalization: TextCapitalization.none,
+                        decoration: const InputDecoration(
+                          labelText: 'Chave Secreta (mín. 8 chars)',
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              onPressed: _isBusy ? null : _addOrUpdateUser,
+                              icon: const Icon(Icons.person_add, size: 18),
+                              label: const Text("Salvar"),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.teal.shade700,
+                                foregroundColor: Colors.white,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: _isBusy ? null : _removeUser,
+                              icon: const Icon(Icons.person_remove,
+                                  size: 18, color: Colors.redAccent),
+                              label: const Text(
+                                "Remover",
+                                style: TextStyle(color: Colors.redAccent),
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                side: const BorderSide(color: Colors.redAccent),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+
+            const SizedBox(height: 16),
             Container(
-              height: 150,
+              height: 130,
               width: double.infinity,
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
