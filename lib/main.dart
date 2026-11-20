@@ -43,21 +43,19 @@ class _LockControlPageState extends State<LockControlPage> {
   static const String serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
   static const String charTxUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a7";
   static const String charRxUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+  static const String charStatusUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a9";
 
-  final TextEditingController _userIdController =
-      TextEditingController(text: "admin_01");
-  final TextEditingController _secretController =
-      TextEditingController(text: "12345678");
+  final TextEditingController _userIdController = TextEditingController();
+  final TextEditingController _secretController = TextEditingController();
 
-  // Controladores do painel administrativo
   final TextEditingController _targetUserController = TextEditingController();
   final TextEditingController _targetSecretController = TextEditingController();
 
   bool _isBusy = false;
   bool _obscureSecret = true;
+  bool _obscureTargetSecret = true;
   String _statusMessage = "Pronto para destrancar";
   Color _statusColor = Colors.grey;
-  final List<String> _logs = [];
 
   bool get _isAdmin => _userIdController.text.trim() == "admin_01";
 
@@ -76,15 +74,11 @@ class _LockControlPageState extends State<LockControlPage> {
     super.dispose();
   }
 
-  void _addLog(String text, {Color? color}) {
+  void _setStatus(String text, Color color) {
     if (!mounted) return;
     setState(() {
-      final now = DateTime.now();
-      final time =
-          "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
-      _logs.insert(0, "[$time] $text");
       _statusMessage = text;
-      if (color != null) _statusColor = color;
+      _statusColor = color;
     });
   }
 
@@ -99,39 +93,41 @@ class _LockControlPageState extends State<LockControlPage> {
       final statuses = await [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
-        Permission.locationWhenInUse,
       ].request();
 
-      final scanOk = statuses[Permission.bluetoothScan]?.isGranted ?? false;
-      final connectOk = statuses[Permission.bluetoothConnect]?.isGranted ?? false;
+      final scanStatus = statuses[Permission.bluetoothScan];
+      final connectStatus = statuses[Permission.bluetoothConnect];
 
-      if (!scanOk || !connectOk) {
-        _addLog("Permissões Bluetooth negadas.", color: Colors.redAccent);
+      if (scanStatus == PermissionStatus.permanentlyDenied ||
+          connectStatus == PermissionStatus.permanentlyDenied) {
+        _setStatus("Permissão bloqueada nas configurações.", Colors.orangeAccent);
+        await openAppSettings();
+        return false;
+      }
+
+      if (!(scanStatus?.isGranted ?? false) ||
+          !(connectStatus?.isGranted ?? false)) {
+        _setStatus("Permissões Bluetooth negadas.", Colors.redAccent);
         return false;
       }
     }
     return true;
   }
 
-  /// Executa qualquer transação BLE autenticada (abertura ou comando admin)
   Future<void> _executeBleTransaction({
+    required String userId,
+    required String secret,
     required String Function(String nonce) buildPayload,
-    required String successFeedback,
   }) async {
     if (_isBusy) return;
 
-    final userId = _userIdController.text.trim();
-    final secret = _secretController.text.trim();
-
     if (userId.isEmpty || secret.isEmpty) {
-      _addLog("Preencha o ID e a chave do usuário.", color: Colors.orangeAccent);
+      _setStatus("Preencha o ID e a chave do usuário.", Colors.orangeAccent);
       return;
     }
 
-    setState(() {
-      _isBusy = true;
-      _logs.clear();
-    });
+    setState(() => _isBusy = true);
+    _setStatus("Conectando...", Colors.blueAccent);
 
     BluetoothDevice? targetDevice;
     StreamSubscription<List<ScanResult>>? scanSub;
@@ -141,11 +137,9 @@ class _LockControlPageState extends State<LockControlPage> {
 
       final adapterState = await FlutterBluePlus.adapterState.first;
       if (adapterState != BluetoothAdapterState.on) {
-        _addLog("Ligue o Bluetooth do celular.", color: Colors.orangeAccent);
+        _setStatus("Ligue o Bluetooth do celular.", Colors.orangeAccent);
         return;
       }
-
-      _addLog("Procurando $targetDeviceName...", color: Colors.blueAccent);
 
       final completer = Completer<BluetoothDevice>();
       scanSub = FlutterBluePlus.scanResults.listen((results) {
@@ -170,10 +164,10 @@ class _LockControlPageState extends State<LockControlPage> {
       await FlutterBluePlus.stopScan();
       await scanSub.cancel();
 
-      _addLog("Conectando ao ESP32...", color: Colors.blueAccent);
       await targetDevice.connect(
         timeout: const Duration(seconds: 6),
-        autoConnect: false, license: License.free,
+        autoConnect: false, 
+        license: License.free,
       );
 
       if (Platform.isAndroid) {
@@ -184,6 +178,7 @@ class _LockControlPageState extends State<LockControlPage> {
       final services = await targetDevice.discoverServices();
       BluetoothCharacteristic? txChar;
       BluetoothCharacteristic? rxChar;
+      BluetoothCharacteristic? statusChar;
 
       for (final s in services) {
         if (s.uuid.str.toLowerCase() == serviceUuid.toLowerCase()) {
@@ -191,45 +186,96 @@ class _LockControlPageState extends State<LockControlPage> {
             final uuid = c.uuid.str.toLowerCase();
             if (uuid == charTxUuid.toLowerCase()) txChar = c;
             if (uuid == charRxUuid.toLowerCase()) rxChar = c;
+            if (uuid == charStatusUuid.toLowerCase()) statusChar = c;
           }
         }
       }
 
-      if (txChar == null || rxChar == null) {
+      if (txChar == null || rxChar == null || statusChar == null) {
         throw Exception("Serviço BLE da trava não encontrado.");
       }
 
-      // Lê o Nonce gerado sob demanda no onRead do ESP32
-      _addLog("Obtendo desafio...", color: Colors.blueAccent);
+      // 1. Lê o Nonce gerado sob demanda no onRead do ESP32
       final nonceBytes = await txChar.read();
       final nonce = utf8.decode(nonceBytes).trim();
 
       if (nonce.length != 32) {
-        throw Exception("Nonce inválido (${nonce.length} bytes).");
+        throw Exception("Falha ao obter desafio do dispositivo.");
       }
 
-      final outboundPayload = buildPayload(nonce);
-      _addLog("Enviando pacote (${outboundPayload.length}B)...",
-          color: Colors.blueAccent);
+      // Prepara o ouvinte de status ANTES de enviar o comando
+      final statusCompleter = Completer<String>();
+      final statusSub = statusChar.onValueReceived.listen((bytes) {
+        if (bytes.isNotEmpty && !statusCompleter.isCompleted) {
+          final val = utf8.decode(bytes).trim();
+          if (val != "IDLE" && val != "PENDING") {
+            statusCompleter.complete(val);
+          }
+        }
+      });
 
+      await statusChar.setNotifyValue(true);
+
+      // 2. Envia o payload assinado (abertura ou comando admin)
+      final outboundPayload = buildPayload(nonce);
       await rxChar.write(
         utf8.encode(outboundPayload),
         withoutResponse: false,
       );
 
-      _addLog(successFeedback, color: Colors.greenAccent);
+      // 3. Aguarda a resposta real empurrada pelo ESP32 via NOTIFY
+      String resultCode;
+      try {
+        resultCode = await statusCompleter.future.timeout(
+          const Duration(seconds: 2),
+        );
+      } catch (_) {
+        final fallbackBytes = await statusChar.read();
+        resultCode = utf8.decode(fallbackBytes).trim();
+      } finally {
+        await statusSub.cancel();
+      }
+
+      // 3. Lê o resultado processado pelo ESP32
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      switch (resultCode) {
+        case "UNLOCK_OK":
+          _setStatus("Trava Aberta", Colors.greenAccent);
+          break;
+        case "ADD_OK":
+          _setStatus("Usuário Cadastrado", Colors.greenAccent);
+          _targetUserController.clear();
+          _targetSecretController.clear();
+          break;
+        case "DEL_OK":
+          _setStatus("Usuário Deletado", Colors.greenAccent);
+          _targetUserController.clear();
+          _targetSecretController.clear();
+          break;
+        case "ADD_ERR":
+          _setStatus("Erro ao cadastrar usuário", Colors.redAccent);
+          break;
+        case "DEL_ERR":
+          _setStatus("Usuário não encontrado", Colors.orangeAccent);
+          break;
+        case "UNAUTHORIZED":
+        default:
+          _setStatus("Usuário não autorizado", Colors.redAccent);
+          break;
+      }
     } on TimeoutException catch (e) {
-      _addLog(e.message ?? "Tempo esgotado.", color: Colors.orangeAccent);
+      _setStatus(e.message ?? "Tempo esgotado.", Colors.orangeAccent);
     } catch (e) {
-      _addLog(
-        "Erro: ${e.toString().replaceFirst('Exception: ', '')}",
-        color: Colors.redAccent,
+      _setStatus(
+        e.toString().replaceFirst('Exception: ', ''),
+        Colors.redAccent,
       );
     } finally {
       await FlutterBluePlus.stopScan();
       await scanSub?.cancel();
       if (targetDevice != null) {
-        await Future.delayed(const Duration(milliseconds: 300));
+        await Future.delayed(const Duration(milliseconds: 250));
         await targetDevice.disconnect();
       }
       if (mounted) setState(() => _isBusy = false);
@@ -240,12 +286,18 @@ class _LockControlPageState extends State<LockControlPage> {
     final userId = _userIdController.text.trim();
     final secret = _secretController.text.trim();
 
+    // Limpa os campos imediatamente ao clicar em ABRIR TRAVA
+    _userIdController.clear();
+    _secretController.clear();
+    FocusScope.of(context).unfocus();
+
     _executeBleTransaction(
+      userId: userId,
+      secret: secret,
       buildPayload: (nonce) {
         final hmac = _computeHmac(secret, "$userId:$nonce");
         return "$userId:$hmac";
       },
-      successFeedback: "Solicitação de abertura enviada por [$userId]!",
     );
   }
 
@@ -256,23 +308,28 @@ class _LockControlPageState extends State<LockControlPage> {
     final targetKey = _targetSecretController.text.trim();
 
     if (targetId.isEmpty || targetId.length > 15 || targetId.contains(':')) {
-      _addLog("ID do novo usuário inválido (1-15 chars, sem ':').",
-          color: Colors.orangeAccent);
+      _setStatus("ID inválido (1-15 chars, sem ':').", Colors.orangeAccent);
       return;
     }
     if (targetKey.length < 8 || targetKey.contains(':')) {
-      _addLog("Chave inválida (mín. 8 chars, sem ':').",
-          color: Colors.orangeAccent);
+      _setStatus("Chave inválida (mín. 8 chars, sem ':').", Colors.orangeAccent);
       return;
     }
 
+    _userIdController.clear();
+    _secretController.clear();
+    _targetUserController.clear();
+    _targetSecretController.clear();
+    FocusScope.of(context).unfocus();
+
     _executeBleTransaction(
+      userId: adminId,
+      secret: adminSecret,
       buildPayload: (nonce) {
         final hmac =
             _computeHmac(adminSecret, "$adminId:ADD:$targetId:$targetKey:$nonce");
         return "$adminId:ADD:$targetId:$targetKey:$hmac";
       },
-      successFeedback: "Comando ADD enviado para [$targetId]!",
     );
   }
 
@@ -282,17 +339,23 @@ class _LockControlPageState extends State<LockControlPage> {
     final targetId = _targetUserController.text.trim();
 
     if (targetId.isEmpty || targetId == "admin_01") {
-      _addLog("Informe um usuário válido (diferente de admin_01).",
-          color: Colors.orangeAccent);
+      _setStatus("Informe um usuário válido para deletar.", Colors.orangeAccent);
       return;
     }
 
+    _userIdController.clear();
+    _secretController.clear();
+    _targetUserController.clear();
+    _targetSecretController.clear();
+    FocusScope.of(context).unfocus();
+
     _executeBleTransaction(
+      userId: adminId,
+      secret: adminSecret,
       buildPayload: (nonce) {
         final hmac = _computeHmac(adminSecret, "$adminId:DEL:$targetId:$nonce");
         return "$adminId:DEL:$targetId:$hmac";
       },
-      successFeedback: "Comando DEL enviado para [$targetId]!",
     );
   }
 
@@ -338,13 +401,13 @@ class _LockControlPageState extends State<LockControlPage> {
                 ),
               ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 32),
             GestureDetector(
               onTap: _isBusy ? null : _unlockDoor,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 250),
-                width: 155,
-                height: 155,
+                width: 170,
+                height: 170,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: _isBusy
@@ -360,15 +423,15 @@ class _LockControlPageState extends State<LockControlPage> {
                   children: [
                     Icon(
                       _isBusy ? Icons.sync : Icons.lock_open_rounded,
-                      size: 48,
+                      size: 52,
                       color: _isBusy ? Colors.blueAccent : Colors.tealAccent,
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 10),
                     Text(
                       _isBusy ? "AGUARDE" : "ABRIR TRAVA",
                       style: const TextStyle(
                         fontWeight: FontWeight.bold,
-                        fontSize: 14,
+                        fontSize: 15,
                         letterSpacing: 1.1,
                       ),
                     ),
@@ -376,20 +439,19 @@ class _LockControlPageState extends State<LockControlPage> {
                 ),
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 24),
             Text(
               _statusMessage,
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: _statusColor,
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
               ),
             ),
 
-            // Painel exclusivo quando logado como admin_01
             if (_isAdmin) ...[
-              const SizedBox(height: 20),
+              const SizedBox(height: 28),
               Card(
                 color: Colors.teal.withOpacity(0.08),
                 shape: RoundedRectangleBorder(
@@ -430,6 +492,7 @@ class _LockControlPageState extends State<LockControlPage> {
                       const SizedBox(height: 10),
                       TextField(
                         controller: _targetSecretController,
+                        obscureText: _obscureTargetSecret,
                         autocorrect: false,
                         enableSuggestions: false,
                         textCapitalization: TextCapitalization.none,
@@ -475,32 +538,6 @@ class _LockControlPageState extends State<LockControlPage> {
                 ),
               ),
             ],
-
-            const SizedBox(height: 16),
-            Container(
-              height: 130,
-              width: double.infinity,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.black26,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.white12),
-              ),
-              child: ListView.builder(
-                itemCount: _logs.length,
-                itemBuilder: (context, index) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text(
-                    _logs[index],
-                    style: const TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 12,
-                      color: Colors.white70,
-                    ),
-                  ),
-                ),
-              ),
-            ),
           ],
         ),
       ),
